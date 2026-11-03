@@ -36,11 +36,16 @@ class ChatRequest(BaseModel):
 def verify_api_key(authorization: str | None = Header(default=None)) -> None:
     expected = os.getenv("MKUU_API_KEY", "").strip()
     if not expected:
-        if os.getenv("MKUU_ENV", "development").lower() == "production":
+        if os.getenv("MKUU_ENV", "development").strip().lower() == "production":
             raise HTTPException(status_code=503, detail="MKUU_API_KEY must be set in production")
         return
-    scheme, _, supplied = (authorization or "").partition(" ")
-    if scheme.lower() != "bearer" or not secrets.compare_digest(supplied, expected):
+
+    # Accept both "Bearer <key>" and a raw key from API documentation clients.
+    supplied = (authorization or "").strip()
+    if supplied.lower().startswith("bearer "):
+        supplied = supplied[7:].strip()
+
+    if not supplied or not secrets.compare_digest(supplied, expected):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
