@@ -15,10 +15,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 load_dotenv()
 ROOT = Path(__file__).resolve().parents[1]
-app = FastAPI(title="MKUU Foundation Model API", version="0.1.0")
+app = FastAPI(title="MKUU Foundation Model API", version="0.2.0")
 _model = None
 _tokenizer = None
 _model_lock = threading.Lock()
+_model_loading = False
+_model_error: str | None = None
 _api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
 
@@ -42,7 +44,6 @@ def verify_api_key(authorization: str | None = Security(_api_key_header)) -> Non
             raise HTTPException(status_code=503, detail="MKUU_API_KEY must be set in production")
         return
 
-    # Accept both "Bearer <key>" and a raw key from API documentation clients.
     supplied = (authorization or "").strip()
     if supplied.lower().startswith("bearer "):
         supplied = supplied[7:].strip()
@@ -52,24 +53,41 @@ def verify_api_key(authorization: str | None = Security(_api_key_header)) -> Non
 
 
 def load_model():
-    global _model, _tokenizer
+    global _model, _tokenizer, _model_loading, _model_error
     if _model is not None:
         return _tokenizer, _model
+
     with _model_lock:
         if _model is None:
-            model_id = os.getenv("MKUU_BASE_MODEL", "Qwen/Qwen2.5-1.5B-Instruct").strip()
-            if not model_id:
-                raise HTTPException(status_code=503, detail="MKUU_BASE_MODEL is not configured")
-            tokenizer = AutoTokenizer.from_pretrained(model_id)
-            device = os.getenv("MKUU_DEVICE", "auto").lower()
-            kwargs = {"torch_dtype": "auto"}
-            if device == "auto":
-                kwargs["device_map"] = "auto"
-            model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
-            if device != "auto":
-                model.to(device)
-            model.eval()
-            _tokenizer, _model = tokenizer, model
+            _model_loading = True
+            try:
+                model_id = os.getenv("MKUU_BASE_MODEL", "Qwen/Qwen2.5-1.5B-Instruct").strip()
+                if not model_id:
+                    raise RuntimeError("MKUU_BASE_MODEL is not configured")
+
+                tokenizer = AutoTokenizer.from_pretrained(model_id)
+                device = os.getenv("MKUU_DEVICE", "auto").strip().lower()
+                kwargs = {"torch_dtype": "auto"}
+                if device == "auto":
+                    kwargs["device_map"] = "auto"
+
+                model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+                if device != "auto":
+                    model.to(device)
+                model.eval()
+
+                _tokenizer, _model = tokenizer, model
+                _model_error = None
+            except Exception as exc:
+                # Keep the service alive and expose only the exception type, never secrets.
+                _model_error = type(exc).__name__
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"MKUU base model could not be loaded ({_model_error})",
+                ) from exc
+            finally:
+                _model_loading = False
+
     return _tokenizer, _model
 
 
@@ -82,16 +100,17 @@ def system_prompt() -> str:
 
 @app.get("/")
 def root():
-    return {"name": "MKUU Foundation Model API", "health": "/health", "docs": "/docs"}
+    return {"name": "MKUU Foundation Model API", "health": "/health", "model_health": "/health/model"}
 
 
 @app.get("/health")
 def health():
-    # Public diagnostic endpoint: never return the API key itself.
     return {
         "status": "ok",
         "service": "mkuu-foundation",
         "model_loaded": _model is not None,
+        "model_loading": _model_loading,
+        "model_error": _model_error,
         "base_model": os.getenv("MKUU_BASE_MODEL", "Qwen/Qwen2.5-1.5B-Instruct"),
         "api_key_configured": bool(os.getenv("MKUU_API_KEY", "").strip()),
         "environment": os.getenv("MKUU_ENV", "development").strip().lower(),
@@ -100,10 +119,20 @@ def health():
 
 @app.get("/health/model")
 def model_health():
-    # Reports loading state only; it does not trigger a potentially expensive model download.
+    if _model is not None:
+        status = "loaded"
+    elif _model_loading:
+        status = "loading"
+    elif _model_error:
+        status = "error"
+    else:
+        status = "not_loaded"
+
     return {
-        "status": "loaded" if _model is not None else "not_loaded",
+        "status": status,
         "model_loaded": _model is not None,
+        "model_loading": _model_loading,
+        "model_error": _model_error,
         "base_model": os.getenv("MKUU_BASE_MODEL", "Qwen/Qwen2.5-1.5B-Instruct"),
     }
 
@@ -113,31 +142,49 @@ def chat_completions(request: ChatRequest):
     tokenizer, model = load_model()
     messages = [{"role": "system", "content": system_prompt()}]
     messages.extend(m.model_dump() for m in request.messages if m.role != "system")
+
     if not hasattr(tokenizer, "apply_chat_template"):
         raise HTTPException(status_code=500, detail="Selected tokenizer has no chat template")
-    inputs = tokenizer.apply_chat_template(
-        messages, add_generation_prompt=True, tokenize=True,
-        return_tensors="pt", return_dict=True
-    )
+
+    try:
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Could not prepare the conversation for the model") from exc
+
     device = model.get_input_embeddings().weight.device
     inputs = {key: value.to(device) for key, value in inputs.items()}
-    max_tokens = request.max_tokens or int(os.getenv("MKUU_MAX_NEW_TOKENS", "512"))
+    max_tokens = request.max_tokens if request.max_tokens is not None else int(os.getenv("MKUU_MAX_NEW_TOKENS", "512"))
     temperature = request.temperature if request.temperature is not None else float(os.getenv("MKUU_TEMPERATURE", "0.7"))
     top_p = request.top_p if request.top_p is not None else float(os.getenv("MKUU_TOP_P", "0.9"))
+
     generation = {
         "max_new_tokens": max_tokens,
         "do_sample": temperature > 0,
-        "pad_token_id": tokenizer.eos_token_id,
     }
+    if tokenizer.eos_token_id is not None:
+        generation["pad_token_id"] = tokenizer.eos_token_id
     if temperature > 0:
         generation.update({"temperature": temperature, "top_p": top_p})
-    with torch.inference_mode():
-        output = model.generate(**inputs, **generation)
-    answer = tokenizer.decode(
-        output[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True
-    ).strip()
+
+    try:
+        with torch.inference_mode():
+            output = model.generate(**inputs, **generation)
+        answer = tokenizer.decode(
+            output[0][inputs["input_ids"].shape[-1]:],
+            skip_special_tokens=True,
+        ).strip()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="MKUU model generation failed") from exc
+
     if not answer:
         raise HTTPException(status_code=502, detail="The model returned an empty response")
+
     return {
         "id": "mkuu-chat-completion",
         "object": "chat.completion",
