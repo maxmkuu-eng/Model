@@ -9,6 +9,7 @@ from typing import Literal
 import torch
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi.responses import HTMLResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -153,6 +154,98 @@ def model_health():
         "model_error": _model_error,
         "base_model": os.getenv("MKUU_BASE_MODEL", "Qwen/Qwen2.5-1.5B-Instruct"),
     }
+
+
+@app.get("/chat", response_class=HTMLResponse)
+def chat_page():
+    return HTMLResponse(r'''<!doctype html>
+<html lang="sw">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#ffffff">
+<title>MKUU AI — Chat</title>
+<style>
+:root{font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif;color:#172033;background:#f7f9fc}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;flex-direction:column}
+header{padding:15px 18px;background:#fff;border-bottom:1px solid #e7ebf2;display:flex;align-items:center;gap:12px}
+.logo{width:38px;height:38px;border-radius:12px;background:linear-gradient(145deg,#0d4e91,#63b9ef);display:grid;place-items:center;color:white;font-weight:800}
+h1{font-size:17px;margin:0}header small{color:#718096}
+main{width:min(850px,100%);margin:0 auto;flex:1;display:flex;flex-direction:column;padding:18px 14px 12px;min-height:0}
+#chat{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:14px;padding:8px 0 20px}
+.msg{max-width:88%;padding:12px 15px;border-radius:17px;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.5}
+.user{align-self:flex-end;background:#dceeff;border-bottom-right-radius:5px}
+.assistant{align-self:flex-start;background:#fff;border:1px solid #e8edf4;border-bottom-left-radius:5px}
+#empty{text-align:center;color:#64748b;margin:auto;padding:35px 10px}
+#empty strong{display:block;color:#1e3a5f;font-size:25px;margin-bottom:8px}
+.controls{background:#fff;border:1px solid #e2e8f0;border-radius:18px;padding:10px;box-shadow:0 5px 24px #1c35500d}
+#key{width:100%;border:0;border-bottom:1px solid #edf0f5;padding:8px 5px;margin-bottom:8px;outline:none;font-size:13px}
+.composer{display:flex;gap:8px;align-items:flex-end}
+textarea{flex:1;resize:none;min-height:46px;max-height:140px;border:0;outline:none;padding:12px 8px;font:inherit}
+button{border:0;border-radius:13px;background:#145da0;color:white;padding:12px 19px;font-weight:700;cursor:pointer}
+button:disabled{opacity:.55;cursor:wait}
+.note{font-size:11px;color:#8491a3;padding:7px 3px 0}
+#error{color:#b42318;font-size:13px;padding:8px 3px;display:none}
+@media(min-width:700px){main{padding-top:28px}.msg{max-width:75%}}
+</style>
+</head>
+<body>
+<header><div class="logo">M</div><div><h1>MKUU AI</h1><small>MKUU Foundation Model</small></div></header>
+<main>
+<section id="chat" aria-live="polite">
+<div id="empty"><strong>Karibu MKUU AI</strong>Andika ujumbe wako hapa chini tuanze mazungumzo.</div>
+</section>
+<div class="controls">
+<input id="key" type="password" autocomplete="off" placeholder="API key (weka hapa ikiwa inahitajika)">
+<div class="composer">
+<textarea id="message" rows="1" placeholder="Andika ujumbe..." aria-label="Ujumbe wako"></textarea>
+<button id="send">Tuma</button>
+</div>
+<div class="note">API key haitahifadhiwa kwenye simu. Mazungumzo haya yanatumwa moja kwa moja kwa MKUU Model.</div>
+<div id="error" role="alert"></div>
+</div>
+</main>
+<script>
+const chat=document.getElementById('chat');
+const input=document.getElementById('message');
+const keyInput=document.getElementById('key');
+const send=document.getElementById('send');
+const errorBox=document.getElementById('error');
+const history=[];
+function addMessage(role,text){
+ const empty=document.getElementById('empty'); if(empty) empty.remove();
+ const node=document.createElement('div');
+ node.className='msg '+(role==='user'?'user':'assistant');
+ node.textContent=text;
+ chat.appendChild(node); chat.scrollTop=chat.scrollHeight;
+ return node;
+}
+async function submitMessage(){
+ const text=input.value.trim(); if(!text||send.disabled)return;
+ errorBox.style.display='none'; errorBox.textContent='';
+ addMessage('user',text); history.push({role:'user',content:text});
+ input.value=''; input.style.height='auto'; send.disabled=true; send.textContent='...';
+ const waiting=addMessage('assistant','MKUU anafikiria...');
+ try{
+  const headers={'Content-Type':'application/json'};
+  const apiKey=keyInput.value.trim(); if(apiKey)headers.Authorization='Bearer '+apiKey;
+  const response=await fetch('/v1/chat/completions',{method:'POST',headers,body:JSON.stringify({model:'mkuu-foundation',messages:history,max_tokens:512,temperature:0.7})});
+  const data=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error(data.detail||('Ombi limeshindikana (HTTP '+response.status+')'));
+  const answer=data.choices&&data.choices[0]&&data.choices[0].message&&data.choices[0].message.content;
+  if(!answer)throw new Error('Model haikurudisha jibu.');
+  waiting.textContent=answer; history.push({role:'assistant',content:answer});
+ }catch(err){
+  waiting.textContent='Imeshindikana kupata jibu.';
+  errorBox.textContent=err.message;errorBox.style.display='block';
+  history.pop();
+ }finally{send.disabled=false;send.textContent='Tuma';input.focus();chat.scrollTop=chat.scrollHeight;}
+}
+send.addEventListener('click',submitMessage);
+input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();submitMessage();}});
+input.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,140)+'px';});
+</script>
+</body></html>''')
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
