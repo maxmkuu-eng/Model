@@ -8,7 +8,8 @@ from typing import Literal
 
 import torch
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -18,6 +19,7 @@ app = FastAPI(title="MKUU Foundation Model API", version="0.1.0")
 _model = None
 _tokenizer = None
 _model_lock = threading.Lock()
+_api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
 
 class Message(BaseModel):
@@ -33,7 +35,7 @@ class ChatRequest(BaseModel):
     top_p: float | None = Field(default=None, gt=0.0, le=1.0)
 
 
-def verify_api_key(authorization: str | None = Header(default=None)) -> None:
+def verify_api_key(authorization: str | None = Security(_api_key_header)) -> None:
     expected = os.getenv("MKUU_API_KEY", "").strip()
     if not expected:
         if os.getenv("MKUU_ENV", "development").strip().lower() == "production":
