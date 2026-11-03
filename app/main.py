@@ -91,6 +91,24 @@ def load_model():
     return _tokenizer, _model
 
 
+def _preload_model_in_background() -> None:
+    """Start loading Qwen as soon as the service starts, without blocking health checks."""
+    try:
+        load_model()
+    except HTTPException:
+        # The exact failure type is exposed through /health/model; keep API alive.
+        pass
+
+
+@app.on_event("startup")
+def start_model_preload() -> None:
+    threading.Thread(
+        target=_preload_model_in_background,
+        name="mkuu-model-preload",
+        daemon=True,
+    ).start()
+
+
 def system_prompt() -> str:
     path = ROOT / "SYSTEM_PROMPT.md"
     if path.exists():
