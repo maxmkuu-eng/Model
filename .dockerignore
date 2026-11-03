@@ -1,0 +1,15 @@
+.git
+.github
+.env
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.cache
+huggingface
+models
+*.safetensors
+*.bin
+*.pt
+*.pth
