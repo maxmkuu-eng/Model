@@ -85,9 +85,22 @@ def root():
 
 @app.get("/health")
 def health():
+    # Public diagnostic endpoint: never return the API key itself.
     return {
         "status": "ok",
         "service": "mkuu-foundation",
+        "model_loaded": _model is not None,
+        "base_model": os.getenv("MKUU_BASE_MODEL", "Qwen/Qwen2.5-1.5B-Instruct"),
+        "api_key_configured": bool(os.getenv("MKUU_API_KEY", "").strip()),
+        "environment": os.getenv("MKUU_ENV", "development").strip().lower(),
+    }
+
+
+@app.get("/health/model")
+def model_health():
+    # Reports loading state only; it does not trigger a potentially expensive model download.
+    return {
+        "status": "loaded" if _model is not None else "not_loaded",
         "model_loaded": _model is not None,
         "base_model": os.getenv("MKUU_BASE_MODEL", "Qwen/Qwen2.5-1.5B-Instruct"),
     }
